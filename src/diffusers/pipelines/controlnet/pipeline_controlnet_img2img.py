@@ -1071,15 +1071,17 @@ class StableDiffusionControlNetImg2ImgPipeline(DiffusionPipeline, TextualInversi
             assert False
 
         if ref_image is not None:
-            ref_image = self.prepare_image(
-                image=ref_image,
-                width=width,
-                height=height,
-                batch_size=batch_size * num_images_per_prompt,
-                num_images_per_prompt=num_images_per_prompt,
-                device=device,
-                dtype=prompt_embeds.dtype,
-            )
+            print("----------------ref image prep------------")
+            ref_image = self.image_processor.preprocess(ref_image).to(dtype=torch.float32)
+            # ref_image = self.prepare_image(
+            #     image=ref_image,
+            #     width=width,
+            #     height=height,
+            #     batch_size=batch_size * num_images_per_prompt,
+            #     num_images_per_prompt=num_images_per_prompt,
+            #     device=device,
+            #     dtype=prompt_embeds.dtype,
+            # )
 
         # 5. Prepare timesteps
         self.scheduler.set_timesteps(num_inference_steps, device=device)
