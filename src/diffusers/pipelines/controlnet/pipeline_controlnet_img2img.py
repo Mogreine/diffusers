@@ -14,6 +14,7 @@
 
 
 import inspect
+import os
 import warnings
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
@@ -26,6 +27,8 @@ from transformers import CLIPImageProcessor, CLIPTextModel, CLIPTokenizer
 from ...image_processor import VaeImageProcessor
 from ...loaders import LoraLoaderMixin, TextualInversionLoaderMixin
 from ...models import AutoencoderKL, ControlNetModel, UNet2DConditionModel
+from ...models.attention import BasicTransformerBlock
+from ...models.unet_2d_blocks import CrossAttnDownBlock2D, DownBlock2D, CrossAttnUpBlock2D, UpBlock2D
 from ...schedulers import KarrasDiffusionSchedulers
 from ...utils import (
     deprecate,
@@ -91,6 +94,11 @@ EXAMPLE_DOC_STRING = """
         ```
 """
 
+def torch_dfs(model: torch.nn.Module):
+    result = [model]
+    for child in model.children():
+        result += torch_dfs(child)
+    return result
 
 def prepare_image(image):
     if isinstance(image, torch.Tensor):
@@ -517,8 +525,6 @@ class StableDiffusionControlNetImg2ImgPipeline(DiffusionPipeline, TextualInversi
         prompt_embeds=None,
         negative_prompt_embeds=None,
         controlnet_conditioning_scale=1.0,
-        control_guidance_start=0.0,
-        control_guidance_end=1.0,
     ):
         if (callback_steps is None) or (
             callback_steps is not None and (not isinstance(callback_steps, int) or callback_steps <= 0)
@@ -587,7 +593,7 @@ class StableDiffusionControlNetImg2ImgPipeline(DiffusionPipeline, TextualInversi
                 raise ValueError("A single batch of multiple conditionings are supported at the moment.")
             elif len(image) != len(self.controlnet.nets):
                 raise ValueError(
-                    f"For multiple controlnets: `image` must have the same length as the number of controlnets, but got {len(image)} images and {len(self.controlnet.nets)} ControlNets."
+                    "For multiple controlnets: `image` must have the same length as the number of controlnets."
                 )
 
             for image_ in image:
@@ -621,27 +627,6 @@ class StableDiffusionControlNetImg2ImgPipeline(DiffusionPipeline, TextualInversi
         else:
             assert False
 
-        if len(control_guidance_start) != len(control_guidance_end):
-            raise ValueError(
-                f"`control_guidance_start` has {len(control_guidance_start)} elements, but `control_guidance_end` has {len(control_guidance_end)} elements. Make sure to provide the same number of elements to each list."
-            )
-
-        if isinstance(self.controlnet, MultiControlNetModel):
-            if len(control_guidance_start) != len(self.controlnet.nets):
-                raise ValueError(
-                    f"`control_guidance_start`: {control_guidance_start} has {len(control_guidance_start)} elements but there are {len(self.controlnet.nets)} controlnets available. Make sure to provide {len(self.controlnet.nets)}."
-                )
-
-        for start, end in zip(control_guidance_start, control_guidance_end):
-            if start >= end:
-                raise ValueError(
-                    f"control guidance start: {start} cannot be larger or equal to control guidance end: {end}."
-                )
-            if start < 0.0:
-                raise ValueError(f"control guidance start: {start} can't be smaller than 0.")
-            if end > 1.0:
-                raise ValueError(f"control guidance end: {end} can't be larger than 1.0.")
-
     # Copied from diffusers.pipelines.controlnet.pipeline_controlnet.StableDiffusionControlNetPipeline.check_image
     def check_image(self, image, prompt, prompt_embeds):
         image_is_pil = isinstance(image, PIL.Image.Image)
@@ -660,7 +645,7 @@ class StableDiffusionControlNetImg2ImgPipeline(DiffusionPipeline, TextualInversi
             and not image_is_np_list
         ):
             raise TypeError(
-                f"image must be passed and be one of PIL image, numpy array, torch tensor, list of PIL images, list of numpy arrays or list of torch tensors, but is {type(image)}"
+                "image must be passed and be one of PIL image, numpy array, torch tensor, list of PIL images, list of numpy arrays or list of torch tensors"
             )
 
         if image_is_pil:
@@ -749,6 +734,10 @@ class StableDiffusionControlNetImg2ImgPipeline(DiffusionPipeline, TextualInversi
                 init_latents = torch.cat(init_latents, dim=0)
             else:
                 init_latents = self.vae.encode(image).latent_dist.sample(generator)
+                # img_dec = self.vae.decode(init_latents, return_dict=False)[0]
+                # init_latents2 = self.vae.encode(img_dec).latent_dist.sample(generator)
+                # init_latents = init_latents + init_latents - init_latents2
+                # print("Fidelity vae")
 
             init_latents = self.vae.config.scaling_factor * init_latents
 
@@ -774,10 +763,84 @@ class StableDiffusionControlNetImg2ImgPipeline(DiffusionPipeline, TextualInversi
         noise = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
 
         # get latents
+        print(f"init_latents: {init_latents.shape}")
+        print(f"noise: {noise.shape}")
+        print(f"timestep: {timestep.shape}")
         init_latents = self.scheduler.add_noise(init_latents, noise, timestep)
         latents = init_latents
 
         return latents
+
+    # override DiffusionPipeline
+    def save_pretrained(
+        self,
+        save_directory: Union[str, os.PathLike],
+        safe_serialization: bool = False,
+        variant: Optional[str] = None,
+    ):
+        if isinstance(self.controlnet, ControlNetModel):
+            super().save_pretrained(save_directory, safe_serialization, variant)
+        else:
+            raise NotImplementedError("Currently, the `save_pretrained()` is not implemented for Multi-ControlNet.")
+    def prepare_ref_latents(self, refimage, batch_size, dtype, device, generator, do_classifier_free_guidance):
+        refimage = refimage.to(device=device, dtype=dtype)
+
+        # encode the mask image into latents space so we can concatenate it to the latents
+        if isinstance(generator, list):
+            ref_image_latents = [
+                self.vae.encode(refimage[i : i + 1]).latent_dist.sample(generator=generator[i])
+                for i in range(batch_size)
+            ]
+            ref_image_latents = torch.cat(ref_image_latents, dim=0)
+        else:
+            ref_image_latents = self.vae.encode(refimage).latent_dist.sample(generator=generator)
+        ref_image_latents = self.vae.config.scaling_factor * ref_image_latents
+
+        # duplicate mask and ref_image_latents for each generation per prompt, using mps friendly method
+        if ref_image_latents.shape[0] < batch_size:
+            if not batch_size % ref_image_latents.shape[0] == 0:
+                raise ValueError(
+                    "The passed images and the required batch size don't match. Images are supposed to be duplicated"
+                    f" to a total batch size of {batch_size}, but {ref_image_latents.shape[0]} images were passed."
+                    " Make sure the number of images that you pass is divisible by the total requested batch size."
+                )
+            ref_image_latents = ref_image_latents.repeat(batch_size // ref_image_latents.shape[0], 1, 1, 1)
+
+        ref_image_latents = torch.cat([ref_image_latents] * 2) if do_classifier_free_guidance else ref_image_latents
+
+        # aligning device to prevent device errors when concating it with the latent model input
+        ref_image_latents = ref_image_latents.to(device=device, dtype=dtype)
+        return ref_image_latents
+
+    def prepare_image(
+        self,
+        image,
+        width,
+        height,
+        batch_size,
+        num_images_per_prompt,
+        device,
+        dtype,
+        do_classifier_free_guidance=False,
+        guess_mode=False,
+    ):
+        image = self.control_image_processor.preprocess(image, height=height, width=width).to(dtype=torch.float32)
+        image_batch_size = image.shape[0]
+
+        if image_batch_size == 1:
+            repeat_by = batch_size
+        else:
+            # image batch size is the same as prompt batch size
+            repeat_by = num_images_per_prompt
+
+        image = image.repeat_interleave(repeat_by, dim=0)
+
+        image = image.to(device=device, dtype=dtype)
+
+        if do_classifier_free_guidance and not guess_mode:
+            image = torch.cat([image] * 2)
+
+        return image
 
     @torch.no_grad()
     @replace_example_docstring(EXAMPLE_DOC_STRING)
@@ -800,6 +863,7 @@ class StableDiffusionControlNetImg2ImgPipeline(DiffusionPipeline, TextualInversi
             List[PIL.Image.Image],
             List[np.ndarray],
         ] = None,
+        ref_image: Union[torch.FloatTensor, PIL.Image.Image] = None,
         height: Optional[int] = None,
         width: Optional[int] = None,
         strength: float = 0.8,
@@ -819,8 +883,14 @@ class StableDiffusionControlNetImg2ImgPipeline(DiffusionPipeline, TextualInversi
         cross_attention_kwargs: Optional[Dict[str, Any]] = None,
         controlnet_conditioning_scale: Union[float, List[float]] = 0.8,
         guess_mode: bool = False,
-        control_guidance_start: Union[float, List[float]] = 0.0,
-        control_guidance_end: Union[float, List[float]] = 1.0,
+        attention_auto_machine_weight: float = 1.0,
+        gn_auto_machine_weight: float = 1.0,
+        style_fidelity: float = 0.5,
+        reference_attn: bool = True,
+        reference_adain: bool = False,
+        prev_frame: PIL.Image.Image = None,
+        prev_frame_flow: PIL.Image.Image = None,
+        prev_frame_flow_occlusion_mask: PIL.Image.Image = None,
     ):
         r"""
         Function invoked when calling the pipeline for generation.
@@ -901,10 +971,6 @@ class StableDiffusionControlNetImg2ImgPipeline(DiffusionPipeline, TextualInversi
             guess_mode (`bool`, *optional*, defaults to `False`):
                 In this mode, the ControlNet encoder will try best to recognize the content of the input image even if
                 you remove all prompts. The `guidance_scale` between 3.0 and 5.0 is recommended.
-            control_guidance_start (`float` or `List[float]`, *optional*, defaults to 0.0):
-                The percentage of total steps at which the controlnet starts applying.
-            control_guidance_end (`float` or `List[float]`, *optional*, defaults to 1.0):
-                The percentage of total steps at which the controlnet stops applying.
 
         Examples:
 
@@ -915,19 +981,6 @@ class StableDiffusionControlNetImg2ImgPipeline(DiffusionPipeline, TextualInversi
             list of `bool`s denoting whether the corresponding generated image likely represents "not-safe-for-work"
             (nsfw) content, according to the `safety_checker`.
         """
-        controlnet = self.controlnet._orig_mod if is_compiled_module(self.controlnet) else self.controlnet
-
-        # align format for control guidance
-        if not isinstance(control_guidance_start, list) and isinstance(control_guidance_end, list):
-            control_guidance_start = len(control_guidance_end) * [control_guidance_start]
-        elif not isinstance(control_guidance_end, list) and isinstance(control_guidance_start, list):
-            control_guidance_end = len(control_guidance_start) * [control_guidance_end]
-        elif not isinstance(control_guidance_start, list) and not isinstance(control_guidance_end, list):
-            mult = len(controlnet.nets) if isinstance(controlnet, MultiControlNetModel) else 1
-            control_guidance_start, control_guidance_end = mult * [control_guidance_start], mult * [
-                control_guidance_end
-            ]
-
         # 1. Check inputs. Raise error if not correct
         self.check_inputs(
             prompt,
@@ -937,8 +990,6 @@ class StableDiffusionControlNetImg2ImgPipeline(DiffusionPipeline, TextualInversi
             prompt_embeds,
             negative_prompt_embeds,
             controlnet_conditioning_scale,
-            control_guidance_start,
-            control_guidance_end,
         )
 
         # 2. Define call parameters
@@ -1019,10 +1070,23 @@ class StableDiffusionControlNetImg2ImgPipeline(DiffusionPipeline, TextualInversi
         else:
             assert False
 
+        if ref_image is not None:
+            ref_image = self.prepare_image(
+                image=ref_image,
+                width=width,
+                height=height,
+                batch_size=batch_size * num_images_per_prompt,
+                num_images_per_prompt=num_images_per_prompt,
+                device=device,
+                dtype=prompt_embeds.dtype,
+            )
+
         # 5. Prepare timesteps
         self.scheduler.set_timesteps(num_inference_steps, device=device)
         timesteps, num_inference_steps = self.get_timesteps(num_inference_steps, strength, device)
         latent_timestep = timesteps[:1].repeat(batch_size * num_images_per_prompt)
+
+        print(f"latent_timestep {latent_timestep}")
 
         # 6. Prepare latent variables
         latents = self.prepare_latents(
@@ -1034,21 +1098,381 @@ class StableDiffusionControlNetImg2ImgPipeline(DiffusionPipeline, TextualInversi
             device,
             generator,
         )
+        if ref_image is not None:
+            ref_image_latents = self.prepare_ref_latents(
+                ref_image,
+                batch_size * num_images_per_prompt,
+                prompt_embeds.dtype,
+                device,
+                generator,
+                do_classifier_free_guidance,
+            )
 
         # 7. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
 
-        # 7.1 Create tensor stating which controlnets to keep
-        controlnet_keep = []
-        for i in range(len(timesteps)):
-            keeps = [
-                1.0 - float(i / len(timesteps) < s or (i + 1) / len(timesteps) > e)
-                for s, e in zip(control_guidance_start, control_guidance_end)
-            ]
-            controlnet_keep.append(keeps[0] if len(keeps) == 1 else keeps)
+        # 9. Modify self attention and group norm
+        if ref_image is not None:
+            MODE = "write"
+            uc_mask = (
+                torch.Tensor([1] * batch_size * num_images_per_prompt + [0] * batch_size * num_images_per_prompt)
+                .type_as(ref_image_latents)
+                .bool()
+            )
+
+        def hacked_basic_transformer_inner_forward(
+            self,
+            hidden_states: torch.FloatTensor,
+            attention_mask: Optional[torch.FloatTensor] = None,
+            encoder_hidden_states: Optional[torch.FloatTensor] = None,
+            encoder_attention_mask: Optional[torch.FloatTensor] = None,
+            timestep: Optional[torch.LongTensor] = None,
+            cross_attention_kwargs: Dict[str, Any] = None,
+            class_labels: Optional[torch.LongTensor] = None,
+        ):
+            if self.use_ada_layer_norm:
+                norm_hidden_states = self.norm1(hidden_states, timestep)
+            elif self.use_ada_layer_norm_zero:
+                norm_hidden_states, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.norm1(
+                    hidden_states, timestep, class_labels, hidden_dtype=hidden_states.dtype
+                )
+            else:
+                norm_hidden_states = self.norm1(hidden_states)
+
+            # 1. Self-Attention
+            cross_attention_kwargs = cross_attention_kwargs if cross_attention_kwargs is not None else {}
+            if self.only_cross_attention:
+                attn_output = self.attn1(
+                    norm_hidden_states,
+                    encoder_hidden_states=encoder_hidden_states if self.only_cross_attention else None,
+                    attention_mask=attention_mask,
+                    **cross_attention_kwargs,
+                )
+            else:
+                if MODE == "write":
+                    self.bank.append(norm_hidden_states.detach().clone())
+                    attn_output = self.attn1(
+                        norm_hidden_states,
+                        encoder_hidden_states=encoder_hidden_states if self.only_cross_attention else None,
+                        attention_mask=attention_mask,
+                        **cross_attention_kwargs,
+                    )
+                if MODE == "read":
+                    if attention_auto_machine_weight > self.attn_weight:
+                        attn_output_uc = self.attn1(
+                            norm_hidden_states,
+                            encoder_hidden_states=torch.cat([norm_hidden_states] + self.bank, dim=1),
+                            # attention_mask=attention_mask,
+                            **cross_attention_kwargs,
+                        )
+                        attn_output_c = attn_output_uc.clone()
+                        if do_classifier_free_guidance and style_fidelity > 0:
+                            attn_output_c[uc_mask] = self.attn1(
+                                norm_hidden_states[uc_mask],
+                                encoder_hidden_states=norm_hidden_states[uc_mask],
+                                **cross_attention_kwargs,
+                            )
+                        attn_output = style_fidelity * attn_output_c + (1.0 - style_fidelity) * attn_output_uc
+                        self.bank.clear()
+                    else:
+                        attn_output = self.attn1(
+                            norm_hidden_states,
+                            encoder_hidden_states=encoder_hidden_states if self.only_cross_attention else None,
+                            attention_mask=attention_mask,
+                            **cross_attention_kwargs,
+                        )
+            if self.use_ada_layer_norm_zero:
+                attn_output = gate_msa.unsqueeze(1) * attn_output
+            hidden_states = attn_output + hidden_states
+
+            if self.attn2 is not None:
+                norm_hidden_states = (
+                    self.norm2(hidden_states, timestep) if self.use_ada_layer_norm else self.norm2(hidden_states)
+                )
+
+                # 2. Cross-Attention
+                attn_output = self.attn2(
+                    norm_hidden_states,
+                    encoder_hidden_states=encoder_hidden_states,
+                    attention_mask=encoder_attention_mask,
+                    **cross_attention_kwargs,
+                )
+                hidden_states = attn_output + hidden_states
+
+            # 3. Feed-forward
+            norm_hidden_states = self.norm3(hidden_states)
+
+            if self.use_ada_layer_norm_zero:
+                norm_hidden_states = norm_hidden_states * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
+
+            ff_output = self.ff(norm_hidden_states)
+
+            if self.use_ada_layer_norm_zero:
+                ff_output = gate_mlp.unsqueeze(1) * ff_output
+
+            hidden_states = ff_output + hidden_states
+
+            return hidden_states
+
+        def hacked_mid_forward(self, *args, **kwargs):
+            eps = 1e-6
+            x = self.original_forward(*args, **kwargs)
+            if MODE == "write":
+                if gn_auto_machine_weight >= self.gn_weight:
+                    var, mean = torch.var_mean(x, dim=(2, 3), keepdim=True, correction=0)
+                    self.mean_bank.append(mean)
+                    self.var_bank.append(var)
+            if MODE == "read":
+                if len(self.mean_bank) > 0 and len(self.var_bank) > 0:
+                    var, mean = torch.var_mean(x, dim=(2, 3), keepdim=True, correction=0)
+                    std = torch.maximum(var, torch.zeros_like(var) + eps) ** 0.5
+                    mean_acc = sum(self.mean_bank) / float(len(self.mean_bank))
+                    var_acc = sum(self.var_bank) / float(len(self.var_bank))
+                    std_acc = torch.maximum(var_acc, torch.zeros_like(var_acc) + eps) ** 0.5
+                    x_uc = (((x - mean) / std) * std_acc) + mean_acc
+                    x_c = x_uc.clone()
+                    if do_classifier_free_guidance and style_fidelity > 0:
+                        x_c[uc_mask] = x[uc_mask]
+                    x = style_fidelity * x_c + (1.0 - style_fidelity) * x_uc
+                self.mean_bank = []
+                self.var_bank = []
+            return x
+
+        def hack_CrossAttnDownBlock2D_forward(
+            self,
+            hidden_states: torch.FloatTensor,
+            temb: Optional[torch.FloatTensor] = None,
+            encoder_hidden_states: Optional[torch.FloatTensor] = None,
+            attention_mask: Optional[torch.FloatTensor] = None,
+            cross_attention_kwargs: Optional[Dict[str, Any]] = None,
+            encoder_attention_mask: Optional[torch.FloatTensor] = None,
+        ):
+            eps = 1e-6
+
+            # TODO(Patrick, William) - attention mask is not used
+            output_states = ()
+
+            for i, (resnet, attn) in enumerate(zip(self.resnets, self.attentions)):
+                hidden_states = resnet(hidden_states, temb)
+                hidden_states = attn(
+                    hidden_states,
+                    encoder_hidden_states=encoder_hidden_states,
+                    cross_attention_kwargs=cross_attention_kwargs,
+                    attention_mask=attention_mask,
+                    encoder_attention_mask=encoder_attention_mask,
+                    return_dict=False,
+                )[0]
+                if MODE == "write":
+                    if gn_auto_machine_weight >= self.gn_weight:
+                        var, mean = torch.var_mean(hidden_states, dim=(2, 3), keepdim=True, correction=0)
+                        self.mean_bank.append([mean])
+                        self.var_bank.append([var])
+                if MODE == "read":
+                    if len(self.mean_bank) > 0 and len(self.var_bank) > 0:
+                        var, mean = torch.var_mean(hidden_states, dim=(2, 3), keepdim=True, correction=0)
+                        std = torch.maximum(var, torch.zeros_like(var) + eps) ** 0.5
+                        mean_acc = sum(self.mean_bank[i]) / float(len(self.mean_bank[i]))
+                        var_acc = sum(self.var_bank[i]) / float(len(self.var_bank[i]))
+                        std_acc = torch.maximum(var_acc, torch.zeros_like(var_acc) + eps) ** 0.5
+                        hidden_states_uc = (((hidden_states - mean) / std) * std_acc) + mean_acc
+                        hidden_states_c = hidden_states_uc.clone()
+                        if do_classifier_free_guidance and style_fidelity > 0:
+                            hidden_states_c[uc_mask] = hidden_states[uc_mask]
+                        hidden_states = style_fidelity * hidden_states_c + (1.0 - style_fidelity) * hidden_states_uc
+
+                output_states = output_states + (hidden_states,)
+
+            if MODE == "read":
+                self.mean_bank = []
+                self.var_bank = []
+
+            if self.downsamplers is not None:
+                for downsampler in self.downsamplers:
+                    hidden_states = downsampler(hidden_states)
+
+                output_states = output_states + (hidden_states,)
+
+            return hidden_states, output_states
+
+        def hacked_DownBlock2D_forward(self, hidden_states, temb=None):
+            eps = 1e-6
+
+            output_states = ()
+
+            for i, resnet in enumerate(self.resnets):
+                hidden_states = resnet(hidden_states, temb)
+
+                if MODE == "write":
+                    if gn_auto_machine_weight >= self.gn_weight:
+                        var, mean = torch.var_mean(hidden_states, dim=(2, 3), keepdim=True, correction=0)
+                        self.mean_bank.append([mean])
+                        self.var_bank.append([var])
+                if MODE == "read":
+                    if len(self.mean_bank) > 0 and len(self.var_bank) > 0:
+                        var, mean = torch.var_mean(hidden_states, dim=(2, 3), keepdim=True, correction=0)
+                        std = torch.maximum(var, torch.zeros_like(var) + eps) ** 0.5
+                        mean_acc = sum(self.mean_bank[i]) / float(len(self.mean_bank[i]))
+                        var_acc = sum(self.var_bank[i]) / float(len(self.var_bank[i]))
+                        std_acc = torch.maximum(var_acc, torch.zeros_like(var_acc) + eps) ** 0.5
+                        hidden_states_uc = (((hidden_states - mean) / std) * std_acc) + mean_acc
+                        hidden_states_c = hidden_states_uc.clone()
+                        if do_classifier_free_guidance and style_fidelity > 0:
+                            hidden_states_c[uc_mask] = hidden_states[uc_mask]
+                        hidden_states = style_fidelity * hidden_states_c + (1.0 - style_fidelity) * hidden_states_uc
+
+                output_states = output_states + (hidden_states,)
+
+            if MODE == "read":
+                self.mean_bank = []
+                self.var_bank = []
+
+            if self.downsamplers is not None:
+                for downsampler in self.downsamplers:
+                    hidden_states = downsampler(hidden_states)
+
+                output_states = output_states + (hidden_states,)
+
+            return hidden_states, output_states
+
+        def hacked_CrossAttnUpBlock2D_forward(
+            self,
+            hidden_states: torch.FloatTensor,
+            res_hidden_states_tuple: Tuple[torch.FloatTensor, ...],
+            temb: Optional[torch.FloatTensor] = None,
+            encoder_hidden_states: Optional[torch.FloatTensor] = None,
+            cross_attention_kwargs: Optional[Dict[str, Any]] = None,
+            upsample_size: Optional[int] = None,
+            attention_mask: Optional[torch.FloatTensor] = None,
+            encoder_attention_mask: Optional[torch.FloatTensor] = None,
+        ):
+            eps = 1e-6
+            # TODO(Patrick, William) - attention mask is not used
+            for i, (resnet, attn) in enumerate(zip(self.resnets, self.attentions)):
+                # pop res hidden states
+                res_hidden_states = res_hidden_states_tuple[-1]
+                res_hidden_states_tuple = res_hidden_states_tuple[:-1]
+                hidden_states = torch.cat([hidden_states, res_hidden_states], dim=1)
+                hidden_states = resnet(hidden_states, temb)
+                hidden_states = attn(
+                    hidden_states,
+                    encoder_hidden_states=encoder_hidden_states,
+                    cross_attention_kwargs=cross_attention_kwargs,
+                    attention_mask=attention_mask,
+                    encoder_attention_mask=encoder_attention_mask,
+                    return_dict=False,
+                )[0]
+
+                if MODE == "write":
+                    if gn_auto_machine_weight >= self.gn_weight:
+                        var, mean = torch.var_mean(hidden_states, dim=(2, 3), keepdim=True, correction=0)
+                        self.mean_bank.append([mean])
+                        self.var_bank.append([var])
+                if MODE == "read":
+                    if len(self.mean_bank) > 0 and len(self.var_bank) > 0:
+                        var, mean = torch.var_mean(hidden_states, dim=(2, 3), keepdim=True, correction=0)
+                        std = torch.maximum(var, torch.zeros_like(var) + eps) ** 0.5
+                        mean_acc = sum(self.mean_bank[i]) / float(len(self.mean_bank[i]))
+                        var_acc = sum(self.var_bank[i]) / float(len(self.var_bank[i]))
+                        std_acc = torch.maximum(var_acc, torch.zeros_like(var_acc) + eps) ** 0.5
+                        hidden_states_uc = (((hidden_states - mean) / std) * std_acc) + mean_acc
+                        hidden_states_c = hidden_states_uc.clone()
+                        if do_classifier_free_guidance and style_fidelity > 0:
+                            hidden_states_c[uc_mask] = hidden_states[uc_mask]
+                        hidden_states = style_fidelity * hidden_states_c + (1.0 - style_fidelity) * hidden_states_uc
+
+            if MODE == "read":
+                self.mean_bank = []
+                self.var_bank = []
+
+            if self.upsamplers is not None:
+                for upsampler in self.upsamplers:
+                    hidden_states = upsampler(hidden_states, upsample_size)
+
+            return hidden_states
+
+        def hacked_UpBlock2D_forward(self, hidden_states, res_hidden_states_tuple, temb=None, upsample_size=None):
+            eps = 1e-6
+            for i, resnet in enumerate(self.resnets):
+                # pop res hidden states
+                res_hidden_states = res_hidden_states_tuple[-1]
+                res_hidden_states_tuple = res_hidden_states_tuple[:-1]
+                hidden_states = torch.cat([hidden_states, res_hidden_states], dim=1)
+                hidden_states = resnet(hidden_states, temb)
+
+                if MODE == "write":
+                    if gn_auto_machine_weight >= self.gn_weight:
+                        var, mean = torch.var_mean(hidden_states, dim=(2, 3), keepdim=True, correction=0)
+                        self.mean_bank.append([mean])
+                        self.var_bank.append([var])
+                if MODE == "read":
+                    if len(self.mean_bank) > 0 and len(self.var_bank) > 0:
+                        var, mean = torch.var_mean(hidden_states, dim=(2, 3), keepdim=True, correction=0)
+                        std = torch.maximum(var, torch.zeros_like(var) + eps) ** 0.5
+                        mean_acc = sum(self.mean_bank[i]) / float(len(self.mean_bank[i]))
+                        var_acc = sum(self.var_bank[i]) / float(len(self.var_bank[i]))
+                        std_acc = torch.maximum(var_acc, torch.zeros_like(var_acc) + eps) ** 0.5
+                        hidden_states_uc = (((hidden_states - mean) / std) * std_acc) + mean_acc
+                        hidden_states_c = hidden_states_uc.clone()
+                        if do_classifier_free_guidance and style_fidelity > 0:
+                            hidden_states_c[uc_mask] = hidden_states[uc_mask]
+                        hidden_states = style_fidelity * hidden_states_c + (1.0 - style_fidelity) * hidden_states_uc
+
+            if MODE == "read":
+                self.mean_bank = []
+                self.var_bank = []
+
+            if self.upsamplers is not None:
+                for upsampler in self.upsamplers:
+                    hidden_states = upsampler(hidden_states, upsample_size)
+
+            return hidden_states
+
+        if ref_image is not None:
+            if reference_attn:
+                attn_modules = [module for module in torch_dfs(self.unet) if isinstance(module, BasicTransformerBlock)]
+                attn_modules = sorted(attn_modules, key=lambda x: -x.norm1.normalized_shape[0])
+
+                for i, module in enumerate(attn_modules):
+                    module._original_inner_forward = module.forward
+                    module.forward = hacked_basic_transformer_inner_forward.__get__(module, BasicTransformerBlock)
+                    module.bank = []
+                    module.attn_weight = float(i) / float(len(attn_modules))
+
+            if reference_adain:
+                gn_modules = [self.unet.mid_block]
+                self.unet.mid_block.gn_weight = 0
+
+                down_blocks = self.unet.down_blocks
+                for w, module in enumerate(down_blocks):
+                    module.gn_weight = 1.0 - float(w) / float(len(down_blocks))
+                    gn_modules.append(module)
+
+                up_blocks = self.unet.up_blocks
+                for w, module in enumerate(up_blocks):
+                    module.gn_weight = float(w) / float(len(up_blocks))
+                    gn_modules.append(module)
+
+                for i, module in enumerate(gn_modules):
+                    if getattr(module, "original_forward", None) is None:
+                        module.original_forward = module.forward
+                    if i == 0:
+                        # mid_block
+                        module.forward = hacked_mid_forward.__get__(module, torch.nn.Module)
+                    elif isinstance(module, CrossAttnDownBlock2D):
+                        module.forward = hack_CrossAttnDownBlock2D_forward.__get__(module, CrossAttnDownBlock2D)
+                    elif isinstance(module, DownBlock2D):
+                        module.forward = hacked_DownBlock2D_forward.__get__(module, DownBlock2D)
+                    elif isinstance(module, CrossAttnUpBlock2D):
+                        module.forward = hacked_CrossAttnUpBlock2D_forward.__get__(module, CrossAttnUpBlock2D)
+                    elif isinstance(module, UpBlock2D):
+                        module.forward = hacked_UpBlock2D_forward.__get__(module, UpBlock2D)
+                    module.mean_bank = []
+                    module.var_bank = []
+                    module.gn_weight *= 2
 
         # 8. Denoising loop
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
+        pred_latents = []
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
                 # expand the latents if we are doing classifier free guidance
@@ -1065,17 +1489,12 @@ class StableDiffusionControlNetImg2ImgPipeline(DiffusionPipeline, TextualInversi
                     control_model_input = latent_model_input
                     controlnet_prompt_embeds = prompt_embeds
 
-                if isinstance(controlnet_keep[i], list):
-                    cond_scale = [c * s for c, s in zip(controlnet_conditioning_scale, controlnet_keep[i])]
-                else:
-                    cond_scale = controlnet_conditioning_scale * controlnet_keep[i]
-
                 down_block_res_samples, mid_block_res_sample = self.controlnet(
                     control_model_input,
                     t,
                     encoder_hidden_states=controlnet_prompt_embeds,
                     controlnet_cond=control_image,
-                    conditioning_scale=cond_scale,
+                    conditioning_scale=controlnet_conditioning_scale,
                     guess_mode=guess_mode,
                     return_dict=False,
                 )
@@ -1087,7 +1506,31 @@ class StableDiffusionControlNetImg2ImgPipeline(DiffusionPipeline, TextualInversi
                     down_block_res_samples = [torch.cat([torch.zeros_like(d), d]) for d in down_block_res_samples]
                     mid_block_res_sample = torch.cat([torch.zeros_like(mid_block_res_sample), mid_block_res_sample])
 
+                # ref only part
+                if ref_image is not None:
+                    noise = randn_tensor(
+                        ref_image_latents.shape, generator=generator, device=device, dtype=ref_image_latents.dtype
+                    )
+                    ref_xt = self.scheduler.add_noise(
+                        ref_image_latents,
+                        noise,
+                        t.reshape(
+                            1,
+                        ),
+                    )
+                    ref_xt = self.scheduler.scale_model_input(ref_xt, t)
+
+                    MODE = "write"
+                    self.unet(
+                        ref_xt,
+                        t,
+                        encoder_hidden_states=prompt_embeds,
+                        cross_attention_kwargs=cross_attention_kwargs,
+                        return_dict=False,
+                    )
+
                 # predict the noise residual
+                MODE = "read"
                 noise_pred = self.unet(
                     latent_model_input,
                     t,
@@ -1109,8 +1552,10 @@ class StableDiffusionControlNetImg2ImgPipeline(DiffusionPipeline, TextualInversi
                 # call the callback, if provided
                 if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
                     progress_bar.update()
-                    if callback is not None and i % callback_steps == 0:
-                        callback(i, t, latents)
+                    if callback is not None and i % callback_steps == 0 and i < len(timesteps) - 1:
+                        callback(i, timesteps, latents)
+
+                pred_latents.append(latents)
 
         # If we do sequential model offloading, let's offload unet and controlnet
         # manually for max memory savings
@@ -1140,4 +1585,4 @@ class StableDiffusionControlNetImg2ImgPipeline(DiffusionPipeline, TextualInversi
         if not return_dict:
             return (image, has_nsfw_concept)
 
-        return StableDiffusionPipelineOutput(images=image, nsfw_content_detected=has_nsfw_concept)
+        return StableDiffusionPipelineOutput(images=image, nsfw_content_detected=has_nsfw_concept, latents=pred_latents)
